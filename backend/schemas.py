@@ -1,7 +1,7 @@
-from datetime import datetime
-from typing import List, Optional, Any
+from datetime import datetime, timezone
+from typing import List, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_serializer
 
 
 class ScanRequest(BaseModel):
@@ -37,6 +37,14 @@ class ScanOut(BaseModel):
     passes_count: int
     error: Optional[str] = None
     created_at: datetime
+
+    @field_serializer("created_at")
+    def _as_utc(self, value: datetime) -> str:
+        # La base stocke l'heure UTC sans fuseau : on le précise, sinon le navigateur
+        # l'interprète comme une heure locale et l'affiche décalée.
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
 
 
 class ScanDetailOut(ScanOut):

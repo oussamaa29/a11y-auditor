@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import Column, Integer, String, Float, Text, DateTime
 
@@ -18,4 +18,5 @@ class Scan(Base):
     passes_count = Column(Integer, default=0)
     violations_json = Column(Text, nullable=False)
     error = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    # Heure UTC, stockée sans fuseau (SQLite ne les conserve pas)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
