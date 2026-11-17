@@ -1,9 +1,9 @@
 import json
 import logging
+import threading
 from typing import List
-from urllib.parse import urlparse
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
@@ -12,13 +12,14 @@ from database import Base, engine, get_db
 import models
 import schemas
 from scanner import run_scan
+from url_guard import UnsafeURLError, normalize_url, resolve_public_ip
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("a11y-auditor")
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Auditeur d'accessibilité web (RGAA)", version="1.0.0")
+app = FastAPI(title="Auditeur d'accessibilité web (RGAA)", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,28 +29,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Les routes synchrones tournent dans un pool de threads : ce sémaphore borne le nombre
+# de navigateurs ouverts en même temps, pour qu'une rafale de requêtes ne sature pas la machine.
+_scan_slots = threading.BoundedSemaphore(settings.MAX_CONCURRENT_SCANS)
+
 
 @app.get("/health")
 def health():
     return {"status": "healthy"}
 
 
-def _normalize_url(url: str) -> str:
-    url = url.strip()
-    if not urlparse(url).scheme:
-        url = f"https://{url}"
-    parsed = urlparse(url)
-    if not parsed.netloc:
-        raise HTTPException(400, "URL invalide")
-    return url
-
-
 @app.post("/api/scans", response_model=schemas.ScanDetailOut, status_code=201)
 def create_scan(payload: schemas.ScanRequest, db: Session = Depends(get_db)):
-    url = _normalize_url(payload.url)
-
     try:
-        result = run_scan(url)
+        url = normalize_url(payload.url)
+        pinned_ip = resolve_public_ip(url)
+    except UnsafeURLError as e:
+        raise HTTPException(400, str(e))
+
+    if not _scan_slots.acquire(blocking=False):
+        raise HTTPException(503, "Trop de scans en cours. Réessaie dans quelques secondes.")
+    try:
+        result = run_scan(url, pinned_ip)
+    except UnsafeURLError as e:
+        raise HTTPException(400, str(e))
     except RuntimeError as e:
         scan = models.Scan(
             url=url, score=0, critical_count=0, serious_count=0, moderate_count=0,
@@ -57,8 +60,9 @@ def create_scan(payload: schemas.ScanRequest, db: Session = Depends(get_db)):
         )
         db.add(scan)
         db.commit()
-        db.refresh(scan)
         raise HTTPException(502, str(e))
+    finally:
+        _scan_slots.release()
 
     counts = result["counts"]
     scan = models.Scan(
@@ -90,23 +94,34 @@ def _to_detail(scan: models.Scan) -> schemas.ScanDetailOut:
 
 
 @app.get("/api/scans", response_model=List[schemas.ScanOut])
-def list_scans(db: Session = Depends(get_db)):
-    return db.query(models.Scan).order_by(models.Scan.created_at.desc()).all()
+def list_scans(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    return (
+        db.query(models.Scan)
+        .order_by(models.Scan.created_at.desc(), models.Scan.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+
+def _get_scan_or_404(db: Session, scan_id: int) -> models.Scan:
+    scan = db.get(models.Scan, scan_id)
+    if not scan:
+        raise HTTPException(404, "Scan introuvable")
+    return scan
 
 
 @app.get("/api/scans/{scan_id}", response_model=schemas.ScanDetailOut)
 def get_scan(scan_id: int, db: Session = Depends(get_db)):
-    scan = db.query(models.Scan).get(scan_id)
-    if not scan:
-        raise HTTPException(404, "Scan introuvable")
-    return _to_detail(scan)
+    return _to_detail(_get_scan_or_404(db, scan_id))
 
 
 @app.delete("/api/scans/{scan_id}", status_code=204)
 def delete_scan(scan_id: int, db: Session = Depends(get_db)):
-    scan = db.query(models.Scan).get(scan_id)
-    if not scan:
-        raise HTTPException(404, "Scan introuvable")
-    db.delete(scan)
+    db.delete(_get_scan_or_404(db, scan_id))
     db.commit()
     return None
